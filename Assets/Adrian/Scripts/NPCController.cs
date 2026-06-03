@@ -5,43 +5,53 @@ public class NPCController : MonoBehaviour
 {
     [Header("Referencias")]
     public Transform player;
-    /*[Tooltip("Componente que bloquea los controles del Player al ser tocado")]
-    public PlayerInputBlocker playerInputBlocker;*/
+    public PlayerInputBlocker playerInputBlocker;
 
-    [Header("Configuración")]
-    [Tooltip("Distancia a la que el NPC sale del objeto padre")]
-    public float exitDistance = 1f;
-    [Tooltip("Fuerza hacia arriba cuando choca con un obstáculo")]
+    [Header("Configuración de Movimiento")]
+    public float catchDistance = 0.8f;
+
+    [Header("Stun por Proximidad")]
+    [Tooltip("Distancia a la que el NPC solicita el stun al jugador")]
+    public float stunRange = 1.5f;
+    private bool stunRequested = false;
+
+    [Header("Ragdoll")]
     public float ragdollUpForce = 6f;
-    [Tooltip("Fuerza hacia adelante cuando choca con un obstáculo")]
     public float ragdollForwardForce = 4f;
-    [Tooltip("Tiempo mínimo en modo ragdoll antes de recuperarse")]
-    public float ragdollRecoveryTime = 2f;
+    public float ragdollMinTime = 1.5f;
+    public float getUpDuration = 1f;
 
-    // Estados del NPC
-    private enum State { InParent, Chasing, Ragdoll }
+    [Header("Salida del Padre")]
+    [Tooltip("Objeto vacío hijo del mismo padre que el NPC. El NPC se moverá hacia aquí al salir.")]
+    public Transform exitPoint;
+
+    private Vector3 exitWorldPosition; // guarda la posición mundial al momento de salir
+
+    private enum State { InParent, ExitingParent, Chasing, Ragdoll, GettingUp, StunPending }
     private State currentState = State.InParent;
 
     private NavMeshAgent agent;
-    private Rigidbody[] ragdollBodies;   // todos los Rigidbody de los huesos
-    private Collider[] ragdollColliders; // todos los Colliders de los huesos
+    private Animator animator;
+    private Rigidbody[] ragdollBodies;
+    private Collider[] ragdollColliders;
     private Collider mainCollider;
     private Rigidbody mainRigidbody;
-    private float ragdollTimer = 0f;
-    private Vector3 directionBeforeCollision;
+    private float stateTimer = 0f;
+    private Vector3 lastMoveDirection;
+
+    private static readonly int AnimGettingUp = Animator.StringToHash("GettingUp");
+    private static readonly int AnimRunning = Animator.StringToHash("Running");
 
     void Start()
     {
         agent = GetComponent<NavMeshAgent>();
-        mainCollider = GetComponentInChildren<Collider>();
+        animator = GetComponent<Animator>();
+        mainCollider = GetComponent<Collider>();
         mainRigidbody = GetComponent<Rigidbody>();
-
-        // Recopila todos los rigidbodies/colliders de los huesos del ragdoll
         ragdollBodies = GetComponentsInChildren<Rigidbody>();
         ragdollColliders = GetComponentsInChildren<Collider>();
-
-        // Inicia con ragdoll desactivado
-        SetRagdoll(false);
+        ToggleRagdoll(false);
+        if (agent != null) agent.enabled = false;
     }
 
     void Update()
@@ -49,97 +59,175 @@ public class NPCController : MonoBehaviour
         switch (currentState)
         {
             case State.InParent:
-                // El NPC está dentro del objeto padre, espera a salir
                 break;
 
             case State.Chasing:
                 ChasePlayer();
+                CheckStunRange();   // ← detección por distancia en vez de colisión
                 break;
 
             case State.Ragdoll:
-                ragdollTimer -= Time.deltaTime;
-                if (ragdollTimer <= 0f && IsGrounded())
-                    RecoverFromRagdoll();
+                stateTimer -= Time.deltaTime;
+                if (stateTimer <= 0f && IsGrounded())
+                    StartGettingUp();
+                break;
+
+            case State.GettingUp:
+                stateTimer -= Time.deltaTime;
+                if (stateTimer <= 0f)
+                    FinishGettingUp();
+                break;
+
+            case State.StunPending:
+                // El NPC se queda quieto esperando su turno en la cola de stuns
+                break;
+
+            case State.ExitingParent:
+                MoveToExitPoint();
                 break;
         }
     }
 
-    // ── Llamar este método para que el NPC salga del objeto padre ──────────
+    // ── Salir del padre ────────────────────────────────────────────────────
     public void ExitParent()
     {
         if (currentState != State.InParent) return;
 
-        // Se desvincula del padre y pasa a existir en la escena de forma independiente
+        // Guarda la posición mundial del exitPoint ANTES de desheretarse
+        // (por si el padre sigue moviéndose después)
+        if (exitPoint != null)
+            exitWorldPosition = exitPoint.position;
+        else
+            exitWorldPosition = transform.position; // fallback: se queda donde está
+
+        // Se desheredea del padre
         transform.SetParent(null);
-        currentState = State.Chasing;
+
+        currentState = State.ExitingParent;
+
+        if (animator != null) animator.SetBool(AnimRunning, true);
     }
 
-    // ── Persecución ────────────────────────────────────────────────────────
+    // ── Perseguir ──────────────────────────────────────────────────────────
     void ChasePlayer()
     {
-        if (player == null || agent == null) return;
-        if (agent.isOnNavMesh)
-            agent.SetDestination(player.position);
-
-        // Guarda la dirección de movimiento por si choca
-        if (agent.velocity.sqrMagnitude > 0.1f)
-            directionBeforeCollision = agent.velocity.normalized;
+        if (player == null || agent == null || !agent.isActiveAndEnabled) return;
+        if (agent.isOnNavMesh) agent.SetDestination(player.position);
+        if (agent.velocity.sqrMagnitude > 0.01f)
+            lastMoveDirection = agent.velocity.normalized;
     }
 
-    // ── Detección de colisiones ────────────────────────────────────────────
+    // ── Detección de rango de stun ─────────────────────────────────────────
+    void CheckStunRange()
+    {
+        if (stunRequested || player == null) return;
+
+        float distance = Vector3.Distance(transform.position, player.position);
+        if (distance <= stunRange)
+        {
+            stunRequested = true;
+            currentState = State.StunPending;
+
+            // Detiene al NPC mientras espera su turno
+            if (agent != null) agent.ResetPath();
+
+            // Solicita el stun al manager (entra a la cola si hay otro activo)
+            if (StunManager.Instance != null)
+                StunManager.Instance.RequestStun(this);
+            else if (playerInputBlocker != null)
+                playerInputBlocker.BlockInput(); // fallback si no hay StunManager
+        }
+    }
+
+    /// <summary>
+    /// Llamado por el StunManager cuando le toca el turno a este NPC.
+    /// </summary>
+    public void NotifyStunApplied()
+    {
+        // Aquí puedes reproducir animación de ataque, sonido, VFX, etc.
+        if (animator != null) animator.SetBool(AnimRunning, false);
+    }
+
+    // ── Colisiones para Ragdoll (solo objetos que no sean Player) ──────────
     void OnCollisionEnter(Collision collision)
     {
         if (currentState != State.Chasing) return;
-
-        if (collision.gameObject.CompareTag("Player"))
-        {
-            // Toca al Player → bloquea sus controles
-            /*if (playerInputBlocker != null)
-                playerInputBlocker.BlockInput();*/
-        }
-        else
-        {
-            // Choca con cualquier otra cosa → ragdoll
-            EnterRagdoll();
-        }
+        if (!collision.gameObject.CompareTag("Player"))
+            ActivateRagdoll();
     }
 
     // ── Ragdoll ────────────────────────────────────────────────────────────
-    void EnterRagdoll()
+    void ActivateRagdoll()
     {
         currentState = State.Ragdoll;
-        ragdollTimer = ragdollRecoveryTime;
-
+        stateTimer = ragdollMinTime;
         if (agent != null) agent.enabled = false;
-        SetRagdoll(true);
+        ToggleRagdoll(true);
 
-        // Aplica impulso: hacia arriba + hacia adelante (para pasar el obstáculo)
-        Vector3 force = Vector3.up * ragdollUpForce + directionBeforeCollision * ragdollForwardForce;
-        if (mainRigidbody != null)
-            mainRigidbody.AddForce(force, ForceMode.Impulse);
-
-        // Si usa ragdoll de huesos, aplica la fuerza a la cadera (primer rigidbody)
+        Vector3 impulse = Vector3.up * ragdollUpForce + lastMoveDirection * ragdollForwardForce;
         if (ragdollBodies.Length > 0)
-            ragdollBodies[0].AddForce(force, ForceMode.Impulse);
+            ragdollBodies[0].AddForce(impulse, ForceMode.Impulse);
+        else if (mainRigidbody != null)
+            mainRigidbody.AddForce(impulse, ForceMode.Impulse);
+
+        if (animator != null)
+        {
+            animator.enabled = false;
+            animator.SetBool(AnimRunning, false);
+        }
     }
 
-    void RecoverFromRagdoll()
+    void StartGettingUp()
     {
-        SetRagdoll(false);
+        currentState = State.GettingUp;
+        stateTimer = getUpDuration;
+        ToggleRagdoll(false);
+        if (animator != null)
+        {
+            animator.enabled = true;
+            animator.SetTrigger(AnimGettingUp);
+        }
+    }
 
-        // Reactiva el NavMeshAgent y vuelve a perseguir
+    void FinishGettingUp()
+    {
         if (agent != null)
         {
             agent.enabled = true;
-            agent.Warp(transform.position); // lo coloca en el NavMesh más cercano
+            if (agent.isOnNavMesh) agent.Warp(transform.position);
         }
-
+        if (animator != null) animator.SetBool(AnimRunning, true);
+        stunRequested = false;  // resetea por si se recuperó del ragdoll
         currentState = State.Chasing;
     }
 
-    void SetRagdoll(bool active)
+    void MoveToExitPoint()
     {
-        // Activa o desactiva física de ragdoll en todos los huesos
+        Vector3 direction = (exitWorldPosition - transform.position).normalized;
+        transform.position += direction * agent.speed * Time.deltaTime;
+
+        if (direction.sqrMagnitude > 0.001f)
+        {
+            Quaternion targetRot = Quaternion.LookRotation(direction);
+            transform.rotation = Quaternion.Slerp(
+                transform.rotation, targetRot, agent.angularSpeed * Time.deltaTime);
+        }
+
+        float distance = Vector3.Distance(transform.position, exitWorldPosition);
+        if (distance <= 0.3f)
+        {
+            // Llegó al punto de salida → ahora persigue al jugador con NavMesh
+            if (agent != null)
+            {
+                agent.enabled = true;
+                if (agent.isOnNavMesh) agent.Warp(transform.position);
+            }
+            currentState = State.Chasing;
+        }
+    }
+
+    void ToggleRagdoll(bool active)
+    {
         foreach (var rb in ragdollBodies)
         {
             if (rb == mainRigidbody) continue;
@@ -150,20 +238,27 @@ public class NPCController : MonoBehaviour
             if (col == mainCollider) continue;
             col.enabled = active;
         }
-
-        if (mainRigidbody != null)
-            mainRigidbody.isKinematic = active; // el cuerpo principal cede el control al ragdoll
+        if (mainCollider != null) mainCollider.enabled = !active;
+        if (mainRigidbody != null) mainRigidbody.isKinematic = active;
     }
 
     bool IsGrounded()
     {
-        return Physics.Raycast(transform.position, Vector3.down, 0.3f);
+        Vector3 origin = ragdollBodies.Length > 0
+            ? ragdollBodies[0].position : transform.position;
+        return Physics.Raycast(origin, Vector3.down, 0.4f);
     }
 
-    // ── DEBUG — solo visible y funcional en el Editor ──────────────────────
+    void OnDisable()
+    {
+        // Si el NPC es desactivado mientras está en cola, se elimina
+        if (StunManager.Instance != null)
+            StunManager.Instance.CancelStun(this);
+    }
+
+    // ── Debug ──────────────────────────────────────────────────────────────
 #if UNITY_EDITOR
     [Header("Debug (Solo Editor)")]
-    [Tooltip("Activa esto en Play Mode para llamar a ExitParent() desde el Inspector")]
     [SerializeField] private bool debugExitParent = false;
 
     void OnValidate()
@@ -171,25 +266,20 @@ public class NPCController : MonoBehaviour
         if (Application.isPlaying && debugExitParent)
         {
             debugExitParent = false;
-
-            // Difiere la llamada para que no se ejecute dentro de OnValidate
-            // evita el error de SendMessage durante validación
             UnityEditor.EditorApplication.delayCall += () =>
             {
-                if (this != null)
-                {
-                    ExitParent();
-                    Debug.Log("[NPCController] ExitParent() llamado desde el Inspector.");
-                }
+                if (this != null) ExitParent();
             };
         }
     }
 
     [ContextMenu("Debug: Llamar ExitParent")]
-    void DebugExitParent()
+    void DebugExitParent() => ExitParent();
+
+    void OnDrawGizmos()
     {
-        ExitParent();
-        Debug.Log("[NPCController] ExitParent() llamado desde el menú contextual.");
+        Gizmos.color = Color.red;
+        Gizmos.DrawWireSphere(transform.position, stunRange);
     }
 #endif
 }
