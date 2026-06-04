@@ -11,7 +11,6 @@ public class NPCController : MonoBehaviour
     public float catchDistance = 0.8f;
 
     [Header("Stun por Proximidad")]
-    [Tooltip("Distancia a la que el NPC solicita el stun al jugador")]
     public float stunRange = 1.5f;
     private bool stunRequested = false;
 
@@ -22,10 +21,8 @@ public class NPCController : MonoBehaviour
     public float getUpDuration = 1f;
 
     [Header("Salida del Padre")]
-    [Tooltip("Objeto vacío hijo del mismo padre que el NPC. El NPC se moverá hacia aquí al salir.")]
     public Transform exitPoint;
-
-    private Vector3 exitWorldPosition; // guarda la posición mundial al momento de salir
+    private Vector3 exitWorldPosition;
 
     private enum State { InParent, ExitingParent, Chasing, Ragdoll, GettingUp, StunPending }
     private State currentState = State.InParent;
@@ -42,16 +39,56 @@ public class NPCController : MonoBehaviour
     private static readonly int AnimGettingUp = Animator.StringToHash("GettingUp");
     private static readonly int AnimRunning = Animator.StringToHash("Running");
 
+    private Quaternion getUpStartRotation;
+    private Quaternion getUpTargetRotation;
+
     void Start()
     {
         agent = GetComponent<NavMeshAgent>();
-        animator = GetComponent<Animator>();
+        animator = GetComponentInChildren<Animator>();
         mainCollider = GetComponent<Collider>();
         mainRigidbody = GetComponent<Rigidbody>();
         ragdollBodies = GetComponentsInChildren<Rigidbody>();
         ragdollColliders = GetComponentsInChildren<Collider>();
-        ToggleRagdoll(false);
+
+        // Estado inicial: sin física en huesos, sin collider, sin agente
+        InitializePhysicsState();
         if (agent != null) agent.enabled = false;
+    }
+
+    void InitializePhysicsState()
+    {
+        // ── Root Rigidbody: kinematic, sin gravedad ──────────────────────
+        if (mainRigidbody != null)
+        {
+            mainRigidbody.isKinematic = true;
+            mainRigidbody.useGravity = false;
+            mainRigidbody.linearVelocity = Vector3.zero;
+            mainRigidbody.angularVelocity = Vector3.zero;
+            mainRigidbody.constraints = RigidbodyConstraints.FreezeRotation;
+        }
+
+        // ── Collider del root: OFF hasta llegar al exitPoint ─────────────
+        if (mainCollider != null) mainCollider.enabled = false;
+
+        // ── Huesos: SIEMPRE kinematic — el Animator los controla ─────────
+        // Los huesos nunca deben usar física; solo el root usa física en ragdoll
+        foreach (var rb in ragdollBodies)
+        {
+            if (rb == mainRigidbody) continue;
+            rb.isKinematic = true;
+            rb.useGravity = false;
+        }
+
+        // ── Colliders de huesos: SIEMPRE desactivados ────────────────────
+        // Solo el CapsuleCollider del root interactúa con el mundo
+        foreach (var col in ragdollColliders)
+        {
+            if (col == mainCollider) continue;
+            col.enabled = false;
+        }
+
+        if (animator != null) animator.enabled = true;
     }
 
     void Update()
@@ -61,9 +98,13 @@ public class NPCController : MonoBehaviour
             case State.InParent:
                 break;
 
+            case State.ExitingParent:
+                MoveToExitPoint();
+                break;
+
             case State.Chasing:
                 ChasePlayer();
-                CheckStunRange();   // ← detección por distancia en vez de colisión
+                CheckStunRange();
                 break;
 
             case State.Ragdoll:
@@ -74,16 +115,16 @@ public class NPCController : MonoBehaviour
 
             case State.GettingUp:
                 stateTimer -= Time.deltaTime;
+
+                // Levantarse suave: interpola desde la rotación de caída hacia vertical
+                float t = 1f - Mathf.Clamp01(stateTimer / getUpDuration);
+                transform.rotation = Quaternion.Slerp(getUpStartRotation, getUpTargetRotation, t);
+
                 if (stateTimer <= 0f)
                     FinishGettingUp();
                 break;
 
             case State.StunPending:
-                // El NPC se queda quieto esperando su turno en la cola de stuns
-                break;
-
-            case State.ExitingParent:
-                MoveToExitPoint();
                 break;
         }
     }
@@ -93,19 +134,46 @@ public class NPCController : MonoBehaviour
     {
         if (currentState != State.InParent) return;
 
-        // Guarda la posición mundial del exitPoint ANTES de desheretarse
-        // (por si el padre sigue moviéndose después)
-        if (exitPoint != null)
-            exitWorldPosition = exitPoint.position;
-        else
-            exitWorldPosition = transform.position; // fallback: se queda donde está
+        exitWorldPosition = exitPoint != null ? exitPoint.position : transform.position;
 
-        // Se desheredea del padre
         transform.SetParent(null);
 
+        // FIX 3: el collider NO se activa aquí — se activa al llegar al exitPoint
         currentState = State.ExitingParent;
 
         if (animator != null) animator.SetBool(AnimRunning, true);
+    }
+
+    void MoveToExitPoint()
+    {
+        float speed = agent != null ? agent.speed : 3.5f;
+        Vector3 toExit = exitWorldPosition - transform.position;
+        Vector3 direction = toExit.normalized;
+
+        transform.position += direction * speed * Time.deltaTime;
+
+        if (direction.sqrMagnitude > 0.001f)
+        {
+            Quaternion targetRot = Quaternion.LookRotation(direction);
+            transform.rotation = Quaternion.Slerp(transform.rotation, targetRot, 5f * Time.deltaTime);
+        }
+
+        if (toExit.magnitude <= 0.3f)
+        {
+            // Trigger para detectar colisiones mientras persigue (kinematic no genera OnCollisionEnter)
+            if (mainCollider != null)
+            {
+                mainCollider.enabled = true;
+                mainCollider.isTrigger = true;   // ← trigger mientras persigue
+            }
+
+            if (agent != null)
+            {
+                agent.enabled = true;
+                if (agent.isOnNavMesh) agent.Warp(transform.position);
+            }
+            currentState = State.Chasing;
+        }
     }
 
     // ── Perseguir ──────────────────────────────────────────────────────────
@@ -117,71 +185,92 @@ public class NPCController : MonoBehaviour
             lastMoveDirection = agent.velocity.normalized;
     }
 
-    // ── Detección de rango de stun ─────────────────────────────────────────
+    // ── Stun por proximidad ────────────────────────────────────────────────
     void CheckStunRange()
     {
         if (stunRequested || player == null) return;
 
-        float distance = Vector3.Distance(transform.position, player.position);
-        if (distance <= stunRange)
+        if (Vector3.Distance(transform.position, player.position) <= stunRange)
         {
             stunRequested = true;
             currentState = State.StunPending;
-
-            // Detiene al NPC mientras espera su turno
             if (agent != null) agent.ResetPath();
 
-            // Solicita el stun al manager (entra a la cola si hay otro activo)
             if (StunManager.Instance != null)
                 StunManager.Instance.RequestStun(this);
             else if (playerInputBlocker != null)
-                playerInputBlocker.BlockInput(); // fallback si no hay StunManager
+                playerInputBlocker.BlockInput();
         }
     }
 
-    /// <summary>
-    /// Llamado por el StunManager cuando le toca el turno a este NPC.
-    /// </summary>
     public void NotifyStunApplied()
     {
-        // Aquí puedes reproducir animación de ataque, sonido, VFX, etc.
         if (animator != null) animator.SetBool(AnimRunning, false);
     }
-
-    // ── Colisiones para Ragdoll (solo objetos que no sean Player) ──────────
-    void OnCollisionEnter(Collision collision)
+    void OnTriggerEnter(Collider other)
     {
+        if (transform.parent != null) return;
         if (currentState != State.Chasing) return;
-        if (!collision.gameObject.CompareTag("Player"))
-            ActivateRagdoll();
+        if (other.CompareTag("Player")) return;
+        if (other.CompareTag("Ground")) return;
+
+        ActivateRagdoll();
     }
 
-    // ── Ragdoll ────────────────────────────────────────────────────────────
+    // ── Ragdoll ON ─────────────────────────────────────────────────────────
     void ActivateRagdoll()
     {
         currentState = State.Ragdoll;
         stateTimer = ragdollMinTime;
-        if (agent != null) agent.enabled = false;
-        ToggleRagdoll(true);
 
-        Vector3 impulse = Vector3.up * ragdollUpForce + lastMoveDirection * ragdollForwardForce;
-        if (ragdollBodies.Length > 0)
-            ragdollBodies[0].AddForce(impulse, ForceMode.Impulse);
-        else if (mainRigidbody != null)
-            mainRigidbody.AddForce(impulse, ForceMode.Impulse);
+        if (agent != null) { agent.ResetPath(); agent.enabled = false; }
+        if (animator != null) animator.enabled = false;
 
-        if (animator != null)
+        if (mainCollider != null)
         {
-            animator.enabled = false;
-            animator.SetBool(AnimRunning, false);
+            mainCollider.enabled = true;
+            mainCollider.isTrigger = false;  // ← collider físico para caer y tocar el suelo
+        }
+
+        if (mainRigidbody != null)
+        {
+            mainRigidbody.isKinematic = false;
+            mainRigidbody.useGravity = true;
+            mainRigidbody.constraints = RigidbodyConstraints.None;
+
+            Vector3 dir = lastMoveDirection.sqrMagnitude > 0.01f
+                          ? lastMoveDirection : transform.forward;
+
+            mainRigidbody.AddForce(
+                Vector3.up * ragdollUpForce + dir * ragdollForwardForce,
+                ForceMode.Impulse);
+            mainRigidbody.AddTorque(
+                Random.insideUnitSphere * ragdollUpForce * 0.5f,
+                ForceMode.Impulse);
         }
     }
 
+    // ── Ragdoll OFF → Levantarse ───────────────────────────────────────────
     void StartGettingUp()
     {
         currentState = State.GettingUp;
         stateTimer = getUpDuration;
-        ToggleRagdoll(false);
+
+        // Guarda la rotación actual (tumbado) y la rotación destino (de pie)
+        getUpStartRotation = transform.rotation;
+        getUpTargetRotation = Quaternion.Euler(0f, transform.eulerAngles.y, 0f);
+
+        // Detiene la física
+        if (mainRigidbody != null)
+        {
+            mainRigidbody.isKinematic = true;
+            mainRigidbody.useGravity = false;
+            mainRigidbody.linearVelocity = Vector3.zero;
+            mainRigidbody.angularVelocity = Vector3.zero;
+            mainRigidbody.constraints = RigidbodyConstraints.FreezeRotation;
+        }
+
+        // Reactiva el Animator — ya NO hace snap de rotación, el Update la interpola
         if (animator != null)
         {
             animator.enabled = true;
@@ -191,67 +280,29 @@ public class NPCController : MonoBehaviour
 
     void FinishGettingUp()
     {
+        if (mainCollider != null)
+            mainCollider.isTrigger = true;  // ← vuelve a trigger para seguir detectando
+
         if (agent != null)
         {
             agent.enabled = true;
             if (agent.isOnNavMesh) agent.Warp(transform.position);
         }
         if (animator != null) animator.SetBool(AnimRunning, true);
-        stunRequested = false;  // resetea por si se recuperó del ragdoll
+        stunRequested = false;
         currentState = State.Chasing;
     }
 
-    void MoveToExitPoint()
-    {
-        Vector3 direction = (exitWorldPosition - transform.position).normalized;
-        transform.position += direction * agent.speed * Time.deltaTime;
-
-        if (direction.sqrMagnitude > 0.001f)
-        {
-            Quaternion targetRot = Quaternion.LookRotation(direction);
-            transform.rotation = Quaternion.Slerp(
-                transform.rotation, targetRot, agent.angularSpeed * Time.deltaTime);
-        }
-
-        float distance = Vector3.Distance(transform.position, exitWorldPosition);
-        if (distance <= 0.3f)
-        {
-            // Llegó al punto de salida → ahora persigue al jugador con NavMesh
-            if (agent != null)
-            {
-                agent.enabled = true;
-                if (agent.isOnNavMesh) agent.Warp(transform.position);
-            }
-            currentState = State.Chasing;
-        }
-    }
-
-    void ToggleRagdoll(bool active)
-    {
-        foreach (var rb in ragdollBodies)
-        {
-            if (rb == mainRigidbody) continue;
-            rb.isKinematic = !active;
-        }
-        foreach (var col in ragdollColliders)
-        {
-            if (col == mainCollider) continue;
-            col.enabled = active;
-        }
-        if (mainCollider != null) mainCollider.enabled = !active;
-        if (mainRigidbody != null) mainRigidbody.isKinematic = active;
-    }
-
+    // ── Grounded check (usa el root, no los huesos) ────────────────────────
     bool IsGrounded()
     {
-        Vector3 origin = ragdollBodies.Length > 0
-            ? ragdollBodies[0].position : transform.position;
+        // Pequeño offset hacia arriba para no empezar dentro del suelo
+        Vector3 origin = transform.position + Vector3.up * 0.15f;
         return Physics.Raycast(origin, Vector3.down, 0.4f);
     }
 
     void OnDisable()
     {
-        // Si el NPC es desactivado mientras está en cola, se elimina
         if (StunManager.Instance != null)
             StunManager.Instance.CancelStun(this);
     }
@@ -276,10 +327,18 @@ public class NPCController : MonoBehaviour
     [ContextMenu("Debug: Llamar ExitParent")]
     void DebugExitParent() => ExitParent();
 
+    [ContextMenu("Debug: Forzar Ragdoll ON")]
+    void DebugForceRagdollOn() => ActivateRagdoll();
+
+    [ContextMenu("Debug: Forzar Ragdoll OFF")]
+    void DebugForceRagdollOff() => StartGettingUp();
+
     void OnDrawGizmos()
     {
         Gizmos.color = Color.red;
         Gizmos.DrawWireSphere(transform.position, stunRange);
+        Gizmos.color = Color.yellow;
+        Gizmos.DrawWireSphere(transform.position + Vector3.up * 0.15f, 0.1f);
     }
 #endif
 }
