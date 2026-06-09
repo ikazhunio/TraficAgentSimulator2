@@ -1,7 +1,7 @@
 ﻿using UnityEngine;
 using UnityEngine.AI;
 
-public class NPCController : MonoBehaviour
+public class NPCController : MonoBehaviour, IStunnable
 {
     [Header("Referencias")]
     public Transform player;
@@ -21,10 +21,12 @@ public class NPCController : MonoBehaviour
     public float getUpDuration = 1f;
 
     [Header("Salida del Padre")]
+    public float waitBeforeExit = 3f;
     public Transform exitPoint;
     private Vector3 exitWorldPosition;
+    private float exitTimer = 0f;
 
-    private enum State { InParent, ExitingParent, Chasing, Ragdoll, GettingUp, StunPending }
+    private enum State { InParent, WaitingToExit, ExitingParent, Chasing, Ragdoll, GettingUp, StunPending }
     private State currentState = State.InParent;
 
     private NavMeshAgent agent;
@@ -42,6 +44,13 @@ public class NPCController : MonoBehaviour
     private Quaternion getUpStartRotation;
     private Quaternion getUpTargetRotation;
 
+    private void Awake()
+    {
+        if (player == null)
+            player = GameObject.FindGameObjectWithTag("Player")?.transform;
+        if(playerInputBlocker == null)
+            playerInputBlocker = FindFirstObjectByType<PlayerInputBlocker>();
+    }
     void Start()
     {
         agent = GetComponent<NavMeshAgent>();
@@ -96,6 +105,13 @@ public class NPCController : MonoBehaviour
         switch (currentState)
         {
             case State.InParent:
+
+                break;
+
+            case State.WaitingToExit:
+                exitTimer += Time.deltaTime;
+                if (exitTimer >= waitBeforeExit)
+                    ExitParent();
                 break;
 
             case State.ExitingParent:
@@ -132,7 +148,7 @@ public class NPCController : MonoBehaviour
     // ── Salir del padre ────────────────────────────────────────────────────
     public void ExitParent()
     {
-        if (currentState != State.InParent) return;
+        if (currentState != State.WaitingToExit) return;
 
         exitWorldPosition = exitPoint != null ? exitPoint.position : transform.position;
 
@@ -142,6 +158,13 @@ public class NPCController : MonoBehaviour
         currentState = State.ExitingParent;
 
         if (animator != null) animator.SetBool(AnimRunning, true);
+    }
+
+    public void StartWaitingToExit()
+    {
+        if (currentState != State.InParent) return;
+        exitTimer = 0f;
+        currentState = State.WaitingToExit;
     }
 
     void MoveToExitPoint()
@@ -324,8 +347,8 @@ public class NPCController : MonoBehaviour
         }
     }
 
-    [ContextMenu("Debug: Llamar ExitParent")]
-    void DebugExitParent() => ExitParent();
+    [ContextMenu("Debug: Llamar StartWaitingToExit")]
+    void DebugStartWaitingToExit() => StartWaitingToExit();
 
     [ContextMenu("Debug: Forzar Ragdoll ON")]
     void DebugForceRagdollOn() => ActivateRagdoll();
