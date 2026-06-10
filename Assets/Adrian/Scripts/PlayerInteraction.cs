@@ -1,26 +1,18 @@
 using UnityEngine;
 using UnityEngine.UI;
 
-/// <summary>
-/// Adjunta a la cámara en primera persona del jugador.
-/// Muestra un cursor en pantalla, detecta peatones en rango
-/// y permite hacer clic para cruzarlos.
-/// </summary>
 [RequireComponent(typeof(Camera))]
 public class PlayerInteraction : MonoBehaviour
 {
     [Header("Detección")]
-    [Tooltip("Distancia máxima del raycast para detectar peatones")]
-    public float maxRayDistance = 8f;
-    [Tooltip("Layers que contienen los peatones (asigna el layer del peatón)")]
-    public LayerMask pedestrianLayer;
+    public float maxInteractDistance = 8f;
+    [Tooltip("Qué tan centrado debe estar el peatón en la pantalla (0=cualquier lugar, 1=exactamente al centro). Recomendado: 0.97")]
+    [Range(0.9f, 1f)]
+    public float aimThreshold = 0.97f;
 
     [Header("Cursor")]
-    [Tooltip("RectTransform del Image UI que actúa como cursor (colócalo en el centro del Canvas)")]
     public RectTransform crosshairRect;
-    [Tooltip("Color del cursor cuando no hay peatón en rango")]
     public Color normalColor = Color.white;
-    [Tooltip("Color del cursor cuando hay un peatón interactuable")]
     public Color interactColor = Color.yellow;
 
     private Camera cam;
@@ -30,8 +22,6 @@ public class PlayerInteraction : MonoBehaviour
     void Start()
     {
         cam = GetComponent<Camera>();
-
-        // Oculta el cursor del sistema y lo bloquea al centro (FPS estándar)
         Cursor.lockState = CursorLockMode.Locked;
         Cursor.visible = false;
 
@@ -47,22 +37,48 @@ public class PlayerInteraction : MonoBehaviour
 
     void ScanForPedestrian()
     {
-        Ray ray = new Ray(cam.transform.position, cam.transform.forward);
         PedestrianController found = null;
+        float bestDot = -1f;
+        Vector3 camPos = cam.transform.position;
+        Vector3 camFwd = cam.transform.forward;
 
-        if (Physics.Raycast(ray, out RaycastHit hit, maxRayDistance, pedestrianLayer))
+        // Itera todos los peatones activos — no depende de colliders ni jerarquía
+        foreach (var ped in PedestrianController.All)
         {
-            // Busca el componente tanto en el objeto golpeado como en su padre
-            var ped = hit.collider.GetComponentInParent<PedestrianController>();
-            if (ped != null && ped.IsWaitingAtPoint)
+            if (!ped.IsWaitingAtPoint) continue;
+
+            float dist = Vector3.Distance(camPos, ped.transform.position);
+            if (dist > maxInteractDistance)
             {
-                float dist = Vector3.Distance(transform.position, ped.transform.position);
-                if (dist <= ped.interactRange)
-                    found = ped;
+                continue;
             }
+            if (dist > ped.interactRange)
+            {
+                continue;
+            }
+
+            // Dot product: qué tan centrado está el peatón en la cámara
+            Vector3 dir = (ped.transform.position - camPos).normalized;
+            float dot = Vector3.Dot(camFwd, dir);
+
+            if (dot < aimThreshold)
+            {
+                Debug.Log($"Skipping {ped.name}: not aimed at (dot {dot:F2} < threshold {aimThreshold})");
+                continue;
+            }
+            if (dot <= bestDot)
+            {
+                Debug.Log($"Skipping {ped.name}: less centered than current candidate (dot {dot:F2} <= best {bestDot:F2})");
+                continue;
+            }
+
+            bestDot = dot;
+            Debug.Log($"Candidate {ped.name}: distance {dist:F2}, dot {dot:F2} (best so far)");
+            found = ped;
+            Debug.Log($"Found candidate: {ped.name} at distance {dist:F2} with dot {dot:F2}");
         }
 
-        // Actualiza outline si cambió el peatón detectado
+        // Actualiza outline
         if (found != hoveredPedestrian)
         {
             hoveredPedestrian?.SetOutline(false);
@@ -70,7 +86,7 @@ public class PlayerInteraction : MonoBehaviour
             hoveredPedestrian?.SetOutline(true);
         }
 
-        // Cambia el color del cursor
+        // Actualiza color del cursor
         if (crosshairImage != null)
             crosshairImage.color = hoveredPedestrian != null ? interactColor : normalColor;
     }
@@ -79,8 +95,17 @@ public class PlayerInteraction : MonoBehaviour
     {
         if (!Input.GetMouseButtonDown(0)) return;
         if (hoveredPedestrian == null) return;
-
-        // Dispara el cruce de TODOS los peatones en ese punto
         hoveredPedestrian.CurrentPoint?.TriggerCrossing();
     }
+
+#if UNITY_EDITOR
+    void OnDrawGizmos()
+    {
+        if (cam == null) cam = GetComponent<Camera>();
+        Vector3 origin = cam.transform.position;
+        Vector3 forward = cam.transform.forward * maxInteractDistance;
+        Gizmos.color = Color.green;
+        Gizmos.DrawRay(origin, forward);
+    }
+#endif
 }
