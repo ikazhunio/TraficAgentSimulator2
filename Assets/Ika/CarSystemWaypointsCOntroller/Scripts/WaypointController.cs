@@ -11,6 +11,8 @@ public class WaypointController : MonoBehaviour
 
 
 
+
+
     [Header("Eventos (asignables desde el Inspector)")]
     [Tooltip("Se dispara cuando el carro llega y el trigger está vacío")]
     public UnityEvent<CarController> OnCarArrivedClear;
@@ -21,7 +23,7 @@ public class WaypointController : MonoBehaviour
 
     // Estado interno del trigger
     private GameObject objectInTrigger = null;
-    private string triggerType = ""; // "Car" u "Obstacle"
+    public string triggerType = ""; // "Car" u "Obstacle"
 
     public bool HasObjectInTrigger => objectInTrigger != null;
     public string TriggerObjectType => triggerType;

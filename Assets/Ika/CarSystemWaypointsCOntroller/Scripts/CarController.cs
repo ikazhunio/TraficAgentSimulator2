@@ -6,6 +6,8 @@ public class CarController : MonoBehaviour
     [Header("Waypoints")]
     [Tooltip("Arrastra los WaypointController en orden")]
     public WaypointController[] waypoints;
+    public UnityEvent[] wayPointsEvents;
+
 
     [Header("Movimiento")]
     public float moveSpeed = 5f;
@@ -116,6 +118,7 @@ public class CarController : MonoBehaviour
     void HandleWaypointArrival(int index)
     {
         WaypointController wp = waypoints[index];
+        wayPointsEvents[index].Invoke();
         // ¿Es el último waypoint?
         if (index == waypoints.Length - 1)
         {
@@ -124,6 +127,7 @@ public class CarController : MonoBehaviour
             OnReachedLastWaypoint();
             return;
         }
+
         // Si OnlyRoute está activo: pasa sin detenerse ni ejecutar eventos
         if (wp.OnlyRoute)
         {
