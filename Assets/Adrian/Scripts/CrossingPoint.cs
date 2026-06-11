@@ -49,10 +49,15 @@ public class CrossingPoint : MonoBehaviour
         if (otherPoint == null) return;
 
         var toCross = new List<PedestrianController>(_waiting);
+        int count = toCross.Count;   // cuántos peatones cruzan
         _waiting.Clear();
 
         foreach (var ped in toCross)
             ped.StartCrossing(otherPoint);
+
+        // Recompensa al jugador por cada peatón que cruzó
+        if (count > 0 && ScoreManager.Instance != null)
+            ScoreManager.Instance.RewardPedestrianCrossing(count);
     }
 
 #if UNITY_EDITOR
